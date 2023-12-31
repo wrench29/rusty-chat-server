@@ -3,7 +3,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use tokio::io;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::Mutex;
 use tokio::task::yield_now;
@@ -169,7 +169,7 @@ impl ChatServer {
                         {
                             let stream = connection.write_stream.lock().await;
                             let write_result =
-                                Self::write_to_stream(&stream, message_str.as_bytes()).await;
+                                Self::write_message(&stream, message_str.as_bytes()).await;
                             if write_result.is_err() {
                                 let e = write_result.err().unwrap();
                                 eprintln!(
@@ -244,16 +244,6 @@ impl ChatServer {
             .send(ChatServerEvent::UserDisconnected(connection_id))
             .await
             .unwrap();
-
-        /*
-        let write_result = Self::write_to_stream(&stream, b"Hello World").await;
-        if write_result.is_err() {
-            let e = write_result.err().unwrap();
-            eprintln!("Error: Could not write data into stream of {connection_id} ({e}).");
-            self.connections.remove(&connection_id);
-            return;
-        }
-        */
     }
 
     async fn read_message(
@@ -283,6 +273,23 @@ impl ChatServer {
         }
 
         Ok(buffer)
+    }
+
+    async fn write_message(stream: &OwnedWriteHalf, buf: &[u8]) -> io::Result<()> {
+        let header = (buf.len() as u32).to_le_bytes();
+
+        let write_result = Self::write_to_stream(&stream, &header).await;
+        if write_result.is_err() {
+            let e = write_result.err().unwrap();
+            return Err(e);
+        }
+
+        let write_result = Self::write_to_stream(&stream, buf).await;
+        if write_result.is_err() {
+            let e = write_result.err().unwrap();
+            return Err(e);
+        }
+        Ok(())
     }
 
     async fn read_from_stream(stream: &OwnedReadHalf, buf: &mut [u8]) -> io::Result<usize> {
