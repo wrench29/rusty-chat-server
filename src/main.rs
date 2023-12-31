@@ -1,15 +1,39 @@
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::io;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-
+use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::Mutex;
+use tokio::task::yield_now;
 use uuid::Uuid;
 
 struct ChatServer {
     listener: Rc<TcpListener>,
-    connections: HashMap<String, Arc<Mutex<TcpStream>>>,
     address: String,
+}
+
+struct ChatServerStreams {
+    write_stream: Arc<Mutex<OwnedWriteHalf>>,
+    read_stream: Arc<Mutex<OwnedReadHalf>>,
+}
+
+struct ChatServerState {
+    connections: HashMap<String, Arc<ChatServerStreams>>,
+}
+
+enum ChatServerEvent {
+    UserConnected(String, Arc<ChatServerStreams>),
+    UserDisconnected(String),
+    UserSentMessage(String, String),
+}
+
+// Latter argument is the message
+enum ChatServerMessage {
+    ToAll(String),
+    ToAllExcept(String, String),
+    ToSome(Vec<String>, String),
 }
 
 impl ChatServer {
@@ -23,22 +47,46 @@ impl ChatServer {
 
         Ok(Self {
             listener: Rc::new(listener),
-            connections: HashMap::new(),
             address,
         })
     }
 
-    pub async fn run(mut self) {
+    pub async fn run(self) {
         println!(
             "Log: Started accepting connections at {address}.",
             address = self.address
         );
 
+        let state = Arc::new(Mutex::new(ChatServerState {
+            connections: HashMap::new(),
+        }));
+
+        let (event_sender, event_receiver) = channel::<ChatServerEvent>(32);
+
+        let (message_sender, message_receiver) = channel::<ChatServerMessage>(32);
+
+        let state_clone = state.clone();
+        tokio::spawn(Self::event_listener(
+            state_clone,
+            event_receiver,
+            message_sender,
+        ));
+
+        let state_clone = state.clone();
+        tokio::spawn(Self::message_sender(state_clone, message_receiver));
+
         let listener = Rc::clone(&self.listener);
 
         loop {
             match listener.accept().await {
-                Ok((stream, _)) => self.handle_incoming_tcp_stream(stream).await,
+                Ok((stream, _)) => {
+                    let (stream_read, stream_write) = stream.into_split();
+                    tokio::spawn(Self::handle_incoming_tcp_stream(
+                        stream_write,
+                        stream_read,
+                        event_sender.clone(),
+                    ));
+                }
                 Err(err) => {
                     eprintln!("Error: Could not accept an incoming connection ({err}).");
                 }
@@ -46,58 +94,198 @@ impl ChatServer {
         }
     }
 
-    async fn handle_incoming_tcp_stream(&mut self, stream: TcpStream) {
-        let new_uuid = Uuid::new_v4().to_string();
-
-        self.connections
-            .insert(new_uuid.clone(), Arc::new(Mutex::new(stream)));
-
-        let stream_mutex = self.connections.get(&new_uuid).unwrap().clone();
-        
-        {
-            let stream = stream_mutex.lock().unwrap();
-
-            let client_address = stream
-                .peer_addr()
-                .map(|r| r.to_string())
-                .unwrap_or("UNKNOWN_ADDRESS".to_string());
-    
-            println!("Log: New connection ({client_address}) with UUID {new_uuid}.");
-    
-            let write_result = Self::write_to_stream(&stream, b"Hello World").await;
-            if write_result.is_err() {
-                let e = write_result.err().unwrap();
-                eprintln!("Error: Could not write data into stream of {new_uuid} ({e}).");
-                self.connections.remove(&new_uuid);
+    async fn event_listener(
+        state: Arc<Mutex<ChatServerState>>,
+        mut receiver: Receiver<ChatServerEvent>,
+        message_sender: Sender<ChatServerMessage>,
+    ) {
+        loop {
+            let received_state = receiver.recv().await;
+            if received_state.is_none() {
+                eprintln!(
+                    "Error: Could not receive state from channel because it has been closed."
+                );
                 return;
             }
+            let received_state = received_state.unwrap();
+
+            match received_state {
+                ChatServerEvent::UserConnected(connection_id, streams) => {
+                    {
+                        let client_address = streams
+                            .read_stream
+                            .lock()
+                            .await
+                            .peer_addr()
+                            .map(|r| r.to_string())
+                            .unwrap_or("UNKNOWN_ADDRESS".to_string());
+                        println!("Log: New connection ({client_address}) with ID {connection_id}.");
+                    }
+                    let mut state = state.lock().await;
+                    state.connections.insert(connection_id, streams);
+                }
+                ChatServerEvent::UserDisconnected(connection_id) => {
+                    let mut state = state.lock().await;
+                    state.connections.remove(&connection_id);
+                    println!("Log: Connection {connection_id} has been closed.");
+                }
+                ChatServerEvent::UserSentMessage(connection_id, message_str) => {
+                    message_sender
+                        .send(ChatServerMessage::ToAllExcept(connection_id, message_str))
+                        .await
+                        .unwrap();
+
+                    yield_now().await;
+                }
+            }
         }
-
-        Self::connection_listener(new_uuid.clone(), Arc::clone(&stream_mutex)).await;
-
-        self.connections.remove(&new_uuid);
-
-        println!("Log: Connection {new_uuid} has been closed.");
     }
 
-    async fn connection_listener(connection_id: String, stream: Arc<Mutex<TcpStream>>) {
-        let stream = stream.lock().unwrap();
+    async fn message_sender(
+        state: Arc<Mutex<ChatServerState>>,
+        mut recevier: Receiver<ChatServerMessage>,
+    ) {
+        loop {
+            let message = recevier.recv().await;
+            if message.is_none() {
+                eprintln!(
+                    "Error: Could not receive message from channel because it has been closed."
+                );
+                return;
+            }
+            let message = message.unwrap();
+
+            match message {
+                ChatServerMessage::ToAll(_) => todo!("Not implemented"),
+                ChatServerMessage::ToAllExcept(connection_id_exception, message_str) => {
+                    println!("Log: Requested message distribution to all except self.");
+                    let state = state.lock().await;
+                    for connection_id in state.connections.keys() {
+                        if connection_id == &connection_id_exception {
+                            continue;
+                        }
+                        let connection = state.connections.get(connection_id).unwrap();
+                        println!("Log: Sending to {connection_id}...");
+                        {
+                            let stream = connection.write_stream.lock().await;
+                            let write_result =
+                                Self::write_to_stream(&stream, message_str.as_bytes()).await;
+                            if write_result.is_err() {
+                                let e = write_result.err().unwrap();
+                                eprintln!(
+                                    "Error: Could not send message to connection {connection_id} ({e})."
+                                );
+                                break;
+                            }
+                        }
+                        println!("Log: Sent successfully to {connection_id}.");
+                    }
+                }
+                ChatServerMessage::ToSome(_, _) => todo!("Not implemented"),
+            }
+        }
+    }
+
+    async fn handle_incoming_tcp_stream(
+        write_stream: OwnedWriteHalf,
+        read_stream: OwnedReadHalf,
+        event_sender: Sender<ChatServerEvent>,
+    ) {
+        let connection_id = Uuid::new_v4().to_string();
+
+        let streams = ChatServerStreams {
+            read_stream: Arc::new(Mutex::new(read_stream)),
+            write_stream: Arc::new(Mutex::new(write_stream)),
+        };
+
+        let streams = Arc::new(streams);
+
+        event_sender
+            .send(ChatServerEvent::UserConnected(
+                connection_id.clone(),
+                streams.clone(),
+            ))
+            .await
+            .unwrap();
+
+        yield_now().await;
+
+        loop {
+            // get message, process it, send event
+            let message = Self::read_message(connection_id.clone(), streams.clone()).await;
+            if message.is_err() {
+                break;
+            }
+            let message = message.unwrap();
+            if message.len() == 0 {
+                break;
+            }
+
+            let message_str = String::from_utf8(message);
+            if message_str.is_err() {
+                continue;
+            }
+            let message_str = message_str.unwrap();
+
+            println!("Log: Message from {connection_id}: '{message_str}'.");
+
+            event_sender
+                .send(ChatServerEvent::UserSentMessage(
+                    connection_id.clone(),
+                    message_str,
+                ))
+                .await
+                .unwrap();
+
+            yield_now().await;
+        }
+
+        event_sender
+            .send(ChatServerEvent::UserDisconnected(connection_id))
+            .await
+            .unwrap();
+
+        /*
+        let write_result = Self::write_to_stream(&stream, b"Hello World").await;
+        if write_result.is_err() {
+            let e = write_result.err().unwrap();
+            eprintln!("Error: Could not write data into stream of {connection_id} ({e}).");
+            self.connections.remove(&connection_id);
+            return;
+        }
+        */
+    }
+
+    async fn read_message(
+        connection_id: String,
+        stream: Arc<ChatServerStreams>,
+    ) -> io::Result<Vec<u8>> {
+        let stream = stream.read_stream.lock().await;
 
         let mut header_buffer: [u8; 4] = [0; 4];
         let header_result = Self::read_from_stream(&stream, &mut header_buffer).await;
         if header_result.is_err() {
             let e = header_result.err().unwrap();
             eprintln!("Error: Could not read header of the message from {connection_id} ({e}).");
-            // Send message to close connection
-            return;
+            return Err(e);
         }
 
         // Header is 4 bytes long integer, representing message length
         let header = u32::from_le_bytes(header_buffer);
-        println!("Debug: Message length is {header}.");
+
+        let mut buffer: Vec<u8> = vec![0; header as usize];
+
+        let body_result = Self::read_from_stream(&stream, &mut buffer).await;
+        if body_result.is_err() {
+            let e = header_result.err().unwrap();
+            eprintln!("Error: Could not read body of the message from {connection_id} ({e}).");
+            return Err(e);
+        }
+
+        Ok(buffer)
     }
 
-    async fn read_from_stream(stream: &TcpStream, buf: &mut [u8]) -> io::Result<usize> {
+    async fn read_from_stream(stream: &OwnedReadHalf, buf: &mut [u8]) -> io::Result<usize> {
         let mut cursor: usize = 0;
         loop {
             if cursor >= buf.len() {
@@ -125,7 +313,7 @@ impl ChatServer {
         Ok(0)
     }
 
-    async fn write_to_stream(stream: &TcpStream, buf: &[u8]) -> io::Result<()> {
+    async fn write_to_stream(stream: &OwnedWriteHalf, buf: &[u8]) -> io::Result<()> {
         loop {
             stream.writable().await?;
 
@@ -145,7 +333,7 @@ impl ChatServer {
     }
 }
 
-#[tokio::main(flavor = "multi_thread")]
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<(), ()> {
     let (host, port) = ("127.0.0.1", 6969);
 
