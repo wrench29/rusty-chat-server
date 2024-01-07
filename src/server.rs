@@ -1,16 +1,15 @@
 use std::collections::HashMap;
-use std::rc::Rc;
 use std::sync::Arc;
-use tokio::io;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::Mutex;
 use tokio::task::yield_now;
+use tokio::{io, signal};
 use uuid::Uuid;
 
 pub struct ChatServer {
-    listener: Rc<TcpListener>,
+    listener: Arc<TcpListener>,
     address: String,
 }
 
@@ -27,6 +26,7 @@ enum ChatServerEvent {
     UserConnected(String, Arc<ChatServerStreams>),
     UserDisconnected(String),
     UserSentMessage(String, String),
+    CtrlCPressed,
 }
 
 // Latter argument is the message
@@ -46,7 +46,7 @@ impl ChatServer {
         })?;
 
         Ok(Self {
-            listener: Rc::new(listener),
+            listener: Arc::new(listener),
             address,
         })
     }
@@ -66,26 +66,49 @@ impl ChatServer {
         let (message_sender, message_receiver) = channel::<ChatServerMessage>(32);
 
         let state_clone = state.clone();
-        tokio::spawn(event_handler(state_clone, event_receiver, message_sender));
+        let event_handler_handle =
+            tokio::spawn(event_handler(state_clone, event_receiver, message_sender));
 
         let state_clone = state.clone();
-        tokio::spawn(message_send_handler(state_clone, message_receiver));
+        let sender_handle = tokio::spawn(message_send_handler(state_clone, message_receiver));
 
-        let listener = Rc::clone(&self.listener);
+        let listener = Arc::clone(&self.listener);
+        let event_sender_to_listener = event_sender.clone();
+        let listener_handle = tokio::spawn(tcp_listener_loop(listener, event_sender_to_listener));
 
-        loop {
-            match listener.accept().await {
-                Ok((stream, _)) => {
-                    let (stream_read, stream_write) = stream.into_split();
-                    tokio::spawn(handle_incoming_tcp_stream(
-                        stream_write,
-                        stream_read,
-                        event_sender.clone(),
-                    ));
-                }
-                Err(err) => {
-                    eprintln!("Error: Could not accept an incoming connection ({err}).");
-                }
+        signal::ctrl_c().await.unwrap();
+
+        println!("\n** Detected CTRL^C, stopping the server... **");
+
+        event_sender
+            .send(ChatServerEvent::CtrlCPressed)
+            .await
+            .unwrap();
+
+        yield_now().await;
+
+        let _ = event_handler_handle.await;
+
+        listener_handle.abort();
+        sender_handle.abort();
+
+        println!("** Server has stopped successfully **");
+    }
+}
+
+async fn tcp_listener_loop(listener: Arc<TcpListener>, event_sender: Sender<ChatServerEvent>) {
+    loop {
+        match listener.accept().await {
+            Ok((stream, _)) => {
+                let (stream_read, stream_write) = stream.into_split();
+                tokio::spawn(handle_incoming_tcp_stream(
+                    stream_write,
+                    stream_read,
+                    event_sender.clone(),
+                ));
+            }
+            Err(err) => {
+                eprintln!("Error: Could not accept an incoming connection ({err}).");
             }
         }
     }
@@ -145,6 +168,11 @@ async fn event_handler(
                     .unwrap();
 
                 yield_now().await;
+            }
+            ChatServerEvent::CtrlCPressed => {
+                let mut state = state.lock().await;
+                state.connections.clear();
+                break;
             }
         }
     }
