@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+
+use log::{error, info, warn};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
@@ -34,6 +36,7 @@ enum ChatServerMessage {
     ToAll(String),
     ToAllExcept(String, String),
     ToSome(Vec<String>, String),
+    Stop,
 }
 
 impl ChatServer {
@@ -42,7 +45,7 @@ impl ChatServer {
 
         let address_ref = &address;
         let listener = TcpListener::bind(address_ref).await.map_err(|err| {
-            eprintln!("Error: Could not bind {address_ref} to the server ({err}).");
+            error!("Could not bind {address_ref} to the server ({err}).");
         })?;
 
         Ok(Self {
@@ -52,8 +55,8 @@ impl ChatServer {
     }
 
     pub async fn run(self) {
-        println!(
-            "Log: Started accepting connections at {address}.",
+        info!(
+            "** Started accepting connections at {address}. **",
             address = self.address
         );
 
@@ -66,8 +69,12 @@ impl ChatServer {
         let (message_sender, message_receiver) = channel::<ChatServerMessage>(32);
 
         let state_clone = state.clone();
-        let event_handler_handle =
-            tokio::spawn(event_handler(state_clone, event_receiver, message_sender));
+        let message_sender_clone = message_sender.clone();
+        let event_handler_handle = tokio::spawn(event_handler(
+            state_clone,
+            event_receiver,
+            message_sender_clone,
+        ));
 
         let state_clone = state.clone();
         let sender_handle = tokio::spawn(message_send_handler(state_clone, message_receiver));
@@ -78,12 +85,14 @@ impl ChatServer {
 
         signal::ctrl_c().await.unwrap();
 
-        println!("\n** Detected CTRL^C, stopping the server... **");
+        warn!("** Detected CTRL^C, stopping the server... **");
 
         event_sender
             .send(ChatServerEvent::CtrlCPressed)
             .await
             .unwrap();
+
+        message_sender.send(ChatServerMessage::Stop).await.unwrap();
 
         yield_now().await;
 
@@ -92,7 +101,7 @@ impl ChatServer {
         listener_handle.abort();
         sender_handle.abort();
 
-        println!("** Server has stopped successfully **");
+        info!("** Server has stopped successfully **");
     }
 }
 
@@ -108,7 +117,7 @@ async fn tcp_listener_loop(listener: Arc<TcpListener>, event_sender: Sender<Chat
                 ));
             }
             Err(err) => {
-                eprintln!("Error: Could not accept an incoming connection ({err}).");
+                error!("Could not accept an incoming connection ({err}).");
             }
         }
     }
@@ -122,7 +131,7 @@ async fn event_handler(
     loop {
         let received_state = receiver.recv().await;
         if received_state.is_none() {
-            eprintln!("Error: Could not receive state from channel because it has been closed.");
+            error!("Could not receive state from channel because it has been closed.");
             return;
         }
         let received_state = received_state.unwrap();
@@ -137,7 +146,7 @@ async fn event_handler(
                         .peer_addr()
                         .map(|r| r.to_string())
                         .unwrap_or("UNKNOWN_ADDRESS".to_string());
-                    println!("Log: New connection ({client_address}) with ID {connection_id}.");
+                    info!("New connection ({client_address}) with ID {connection_id}.");
                 }
                 let mut state = state.lock().await;
                 state.connections.insert(connection_id.clone(), streams);
@@ -152,7 +161,7 @@ async fn event_handler(
             ChatServerEvent::UserDisconnected(connection_id) => {
                 let mut state = state.lock().await;
                 state.connections.remove(&connection_id);
-                println!("Log: Connection {connection_id} has been closed.");
+                info!("Connection {connection_id} has been closed.");
 
                 message_sender
                     .send(ChatServerMessage::ToAll(format!(
@@ -185,7 +194,7 @@ async fn message_send_handler(
     loop {
         let message = recevier.recv().await;
         if message.is_none() {
-            eprintln!("Error: Could not receive message from channel because it has been closed.");
+            error!("Could not receive message from channel because it has been closed.");
             return;
         }
         let message = message.unwrap();
@@ -198,12 +207,12 @@ async fn message_send_handler(
             ChatServerMessage::ToAllExcept(connection_id_exception, message_str) => {
                 message_to_send = Some(message_str);
 
-                println!("Log: Requested message distribution to all except self.");
+                info!("Requested message distribution to all except self.");
 
                 let state = state.lock().await;
 
                 if state.connections.len() == 1 {
-                    println!("Log: There is no users to send the message.");
+                    info!("There is no users to send the message.");
                     continue;
                 }
 
@@ -219,6 +228,9 @@ async fn message_send_handler(
                 message_to_send = Some(message_str);
                 users_list = Some(connection_id_exceptions);
             }
+            ChatServerMessage::Stop => {
+                return;
+            }
         }
 
         let final_users_list = if users_list.is_some() {
@@ -233,17 +245,17 @@ async fn message_send_handler(
         for connection_id in final_users_list {
             let state = state.lock().await;
             let connection = state.connections.get(&connection_id).unwrap();
-            println!("Log: Sending to {connection_id}...");
+            info!("Sending to {connection_id}...");
             {
                 let stream = connection.write_stream.lock().await;
                 let write_result = write_message(&stream, message_str.as_bytes()).await;
                 if write_result.is_err() {
                     let e = write_result.err().unwrap();
-                    eprintln!("Error: Could not send message to connection {connection_id} ({e}).");
+                    error!("Could not send message to connection {connection_id} ({e}).");
                     break;
                 }
             }
-            println!("Log: Sent successfully to {connection_id}.");
+            info!("Sent successfully to {connection_id}.");
         }
     }
 }
@@ -289,7 +301,7 @@ async fn handle_incoming_tcp_stream(
         }
         let message_str = message_str.unwrap();
 
-        println!("Log: Message from {connection_id}: '{message_str}'.");
+        info!("Message from {connection_id}: '{message_str}'.");
 
         event_sender
             .send(ChatServerEvent::UserSentMessage(
@@ -318,7 +330,7 @@ async fn read_message(
     let header_result = read_from_stream(&stream, &mut header_buffer).await;
     if header_result.is_err() {
         let e = header_result.err().unwrap();
-        eprintln!("Error: Could not read header of the message from {connection_id} ({e}).");
+        error!("Could not read header of the message from {connection_id} ({e}).");
         return Err(e);
     }
 
@@ -330,7 +342,7 @@ async fn read_message(
     let body_result = read_from_stream(&stream, &mut buffer).await;
     if body_result.is_err() {
         let e = header_result.err().unwrap();
-        eprintln!("Error: Could not read body of the message from {connection_id} ({e}).");
+        error!("Could not read body of the message from {connection_id} ({e}).");
         return Err(e);
     }
 
