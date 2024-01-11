@@ -32,6 +32,9 @@ async fn main() -> Result<(), ()> {
                 log::Level::Trace => Color::White,
             };
 
+            if style_bg_color == Color::White {
+                style.set_color(Color::Black);
+            }
             style.set_bg(style_bg_color);
 
             writeln!(
