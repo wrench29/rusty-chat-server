@@ -172,7 +172,7 @@ async fn event_handler(
             }
             ChatServerEvent::UserSentMessage(connection_id, message_str) => {
                 message_sender
-                    .send(ChatServerMessage::ToAllExcept(connection_id, message_str))
+                    .send(ChatServerMessage::ToAllExcept(connection_id.clone(), format!("[{connection_id}] {message_str}")))
                     .await
                     .unwrap();
 
@@ -233,11 +233,12 @@ async fn message_send_handler(
             }
         }
 
-        let final_users_list = if users_list.is_some() {
-            users_list.unwrap()
-        } else {
-            let state = state.lock().await;
-            state.connections.keys().map(|k| k.to_string()).collect()
+        let final_users_list = match users_list {
+            Some(list) => list,
+            None => {
+                let state = state.lock().await;
+                state.connections.keys().map(|k| k.to_string()).collect()
+            }
         };
 
         let message_str = message_to_send.unwrap();
@@ -291,7 +292,7 @@ async fn handle_incoming_tcp_stream(
             break;
         }
         let message = message.unwrap();
-        if message.len() == 0 {
+        if message.is_empty() {
             break;
         }
 
@@ -352,13 +353,13 @@ async fn read_message(
 async fn write_message(stream: &OwnedWriteHalf, buf: &[u8]) -> io::Result<()> {
     let header = (buf.len() as u32).to_le_bytes();
 
-    let write_result = write_to_stream(&stream, &header).await;
+    let write_result = write_to_stream(stream, &header).await;
     if write_result.is_err() {
         let e = write_result.err().unwrap();
         return Err(e);
     }
 
-    let write_result = write_to_stream(&stream, buf).await;
+    let write_result = write_to_stream(stream, buf).await;
     if write_result.is_err() {
         let e = write_result.err().unwrap();
         return Err(e);
@@ -375,9 +376,9 @@ async fn read_from_stream(stream: &OwnedReadHalf, buf: &mut [u8]) -> io::Result<
 
         stream.readable().await?;
 
-        let mut current_slice = &mut buf[cursor..];
+        let current_slice = &mut buf[cursor..];
 
-        match stream.try_read(&mut current_slice) {
+        match stream.try_read(current_slice) {
             Ok(0) => break,
             Ok(n) => {
                 cursor += n;
@@ -386,7 +387,7 @@ async fn read_from_stream(stream: &OwnedReadHalf, buf: &mut [u8]) -> io::Result<
                 continue;
             }
             Err(e) => {
-                return Err(e.into());
+                return Err(e);
             }
         }
     }
@@ -406,7 +407,7 @@ async fn write_to_stream(stream: &OwnedWriteHalf, buf: &[u8]) -> io::Result<()> 
                 continue;
             }
             Err(e) => {
-                return Err(e.into());
+                return Err(e);
             }
         }
     }

@@ -45,5 +45,5 @@ impl Error for ConfigError {
 
 pub fn read_config() -> Result<Config, ConfigError> {
     let config_raw = fs::read_to_string("config.toml").map_err(|_| ConfigError::FileNotFound)?;
-    toml::from_str(&config_raw).map_err(|e| ConfigError::MalformedConfig(e))
+    toml::from_str(&config_raw).map_err(ConfigError::MalformedConfig)
 }
