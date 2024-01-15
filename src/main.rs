@@ -3,11 +3,12 @@ use std::{io::Write, time::SystemTime};
 use env_logger::fmt::Color;
 use log::{error, warn, LevelFilter};
 
-use server::ChatServer;
+use tcp_server::ChatTcpServer;
 use time::{format_description::parse, OffsetDateTime};
 
 mod config;
 mod server;
+mod tcp_server;
 
 fn get_ip_port_from_config() -> (String, u16) {
     let config_obj = config::read_config();
@@ -67,9 +68,9 @@ async fn main() -> Result<(), ()> {
 
     let (host, port) = get_ip_port_from_config();
 
-    let chat_server = ChatServer::create_async(&host, port).await?;
+    let tcp_chat_server = ChatTcpServer::create_async(&host, port).await?;
 
-    chat_server.run().await;
+    tcp_chat_server.run().await;
 
     Ok(())
 }
