@@ -61,7 +61,6 @@ impl ChatTcpServer {
         }));
 
         let (event_sender, event_receiver) = channel::<ChatServerEvent>(32);
-
         let (message_sender, message_receiver) = channel::<ChatServerMessage>(32);
 
         state
@@ -70,15 +69,12 @@ impl ChatTcpServer {
             .chat_server
             .set_message_sender(message_sender.clone());
 
-        let state_clone = state.clone();
-        let event_handler_handle = tokio::spawn(event_handler(state_clone, event_receiver));
-
-        let state_clone = state.clone();
-        let sender_handle = tokio::spawn(message_send_handler(state_clone, message_receiver));
-
-        let listener = Arc::clone(&self.listener);
-        let event_sender_to_listener = event_sender.clone();
-        let listener_handle = tokio::spawn(tcp_listener_loop(listener, event_sender_to_listener));
+        let event_handler_handle = tokio::spawn(event_handler(state.clone(), event_receiver));
+        let sender_handle = tokio::spawn(message_send_handler(state.clone(), message_receiver));
+        let listener_handle = tokio::spawn(tcp_listener_loop(
+            Arc::clone(&self.listener),
+            event_sender.clone(),
+        ));
 
         signal::ctrl_c().await.unwrap();
 
