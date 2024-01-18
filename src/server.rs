@@ -1,17 +1,14 @@
 use std::collections::HashMap;
 
 use log::info;
-use regex::bytes::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::from_str;
-use tokio::sync::mpsc::Sender;
 
-pub enum ChatServerMessage {
+pub enum ChatServerResponseCommand {
     SendToAll(Vec<u8>),
     SendToAllExcept(String, Vec<u8>),
     SendToSome(Vec<String>, Vec<u8>),
     DisconnectUser(String),
-    StopThread,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -23,7 +20,7 @@ enum ChatRequest {
 #[derive(Serialize, Deserialize)]
 enum ChatResponse {
     AuthenticationResult {
-        result: String,
+        result: bool,
     },
     Message {
         user_name: String,
@@ -49,23 +46,18 @@ struct ChatState {
 }
 
 pub struct ChatServer {
-    sender: Option<Sender<ChatServerMessage>>,
     state: ChatState,
 }
 
 impl ChatServer {
     pub fn new() -> Self {
         Self {
-            sender: None,
             state: ChatState {
                 users: HashMap::new(),
             },
         }
     }
-    pub fn set_message_sender(&mut self, sender: Sender<ChatServerMessage>) {
-        self.sender = Some(sender);
-    }
-    pub async fn on_user_connect(&mut self, user_id: String) {
+    pub fn on_user_connect(&mut self, user_id: String) {
         info!("User {user_id} has connected.");
         self.state.users.insert(
             user_id,
@@ -75,41 +67,31 @@ impl ChatServer {
             },
         );
     }
-    pub async fn on_user_disconnect(&mut self, user_id: String) {
-        let user = self.state.users.get_mut(&user_id);
-        if user.is_none() {
-            return;
-        }
-        let user = user.unwrap();
+    pub fn on_user_disconnect(&mut self, user_id: String) -> Option<ChatServerResponseCommand> {
+        let user = self.state.users.get_mut(&user_id)?;
 
         if user.authenticated {
             let user_name = user.credentials.as_ref().unwrap().name.to_string();
 
-            self.send_response(&ChatResponse::Connection {
+            info!("User {user_id} with name {user_name} has disconnected.");
+
+            Some(Self::make_response_to_all(&ChatResponse::Connection {
                 user_name: user_name.clone(),
                 is_connected: false,
-            })
-            .await;
-
-            info!("User {user_id} with name {user_name} has disconnected.");
+            }))
         } else {
             info!("User {user_id} has disconnected.");
+            self.state.users.remove(&user_id);
+            None
         }
-
-        self.state.users.remove(&user_id);
     }
-    pub async fn on_user_message(&mut self, user_id: String, message: &[u8]) {
-        let request = Self::message_to_request(message);
-        if request.is_none() {
-            return;
-        }
-        let request = request.unwrap();
-
-        let user = self.state.users.get_mut(&user_id);
-        if user.is_none() {
-            return;
-        }
-        let user = user.unwrap();
+    pub fn on_user_message(
+        &mut self,
+        user_id: String,
+        message: &[u8],
+    ) -> Option<Vec<ChatServerResponseCommand>> {
+        let request = Self::message_to_request(message)?;
+        let user = self.state.users.get_mut(&user_id)?;
 
         if user.authenticated {
             if let ChatRequest::Message { message } = request {
@@ -122,15 +104,13 @@ impl ChatServer {
                     message,
                 };
 
-                self.send_response(&response).await;
+                return Some(vec![Self::make_response_to_all(&response)]);
             }
         } else if let ChatRequest::Authentication { name } = request {
             if !Self::verify_name(&name) {
                 info!("User {user_id} could not authenticate with name '{name}', disconnecting.");
 
-                self.send_message(ChatServerMessage::DisconnectUser(user_id))
-                    .await;
-                return;
+                return Some(vec![ChatServerResponseCommand::DisconnectUser(user_id)]);
             }
 
             user.authenticated = true;
@@ -138,19 +118,28 @@ impl ChatServer {
 
             info!("User {user_id} has authenticated with name '{name}'.");
 
-            self.send_response(&ChatResponse::Connection {
-                user_name: name.clone(),
-                is_connected: true,
-            })
-            .await;
+            return Some(vec![
+                Self::make_response_to_user(
+                    &user_id,
+                    &ChatResponse::AuthenticationResult { result: true },
+                ),
+                Self::make_response_to_all(&ChatResponse::Connection {
+                    user_name: name.clone(),
+                    is_connected: true,
+                }),
+            ]);
         }
+
+        None
     }
 
     fn verify_name(name: &str) -> bool {
-        let regex_str = r"^(?=.{8,20}$)(?![_.])(?!.*[_.]{2})[a-zA-Z0-9._]+(?<![_.])$";
-        let regex = Regex::new(regex_str).unwrap();
+        // let regex_str = r"^(?=.{8,20}$)(?![_.])(?!.*[_.]{2})[a-zA-Z0-9._]+(?<![_.])$";
+        // let regex = Regex::new(regex_str).unwrap();
 
-        regex.is_match(name.as_bytes())
+        // regex.is_match(name.as_bytes())
+
+        name.len() > 8 && name.len() < 20
     }
 
     fn message_to_request(message: &[u8]) -> Option<ChatRequest> {
@@ -165,13 +154,13 @@ impl ChatServer {
         }
     }
 
-    async fn send_response(&mut self, response: &ChatResponse) {
+    fn make_response_to_user(user_id: &str, response: &ChatResponse) -> ChatServerResponseCommand {
         let message = serde_json::to_string(response).unwrap();
-        self.send_message(ChatServerMessage::SendToAll(message.into_bytes()))
-            .await;
+        ChatServerResponseCommand::SendToSome(vec![user_id.to_string()], message.into_bytes())
     }
 
-    async fn send_message(&mut self, message: ChatServerMessage) {
-        self.sender.as_mut().unwrap().send(message).await.unwrap();
+    fn make_response_to_all(response: &ChatResponse) -> ChatServerResponseCommand {
+        let message = serde_json::to_string(response).unwrap();
+        ChatServerResponseCommand::SendToAll(message.into_bytes())
     }
 }

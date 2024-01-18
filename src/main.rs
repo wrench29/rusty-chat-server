@@ -7,8 +7,8 @@ use tcp_server::ChatTcpServer;
 use time::{format_description::parse, OffsetDateTime};
 
 mod config;
-mod server;
 mod tcp_server;
+mod server;
 
 fn get_ip_port_from_config() -> (String, u16) {
     let config_obj = config::read_config();
