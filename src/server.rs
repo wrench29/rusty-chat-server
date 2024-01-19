@@ -18,9 +18,15 @@ enum ChatRequest {
 }
 
 #[derive(Serialize, Deserialize)]
+pub enum ChatAuthenticationError {
+    WrongNameOrPassword,
+}
+
+#[derive(Serialize, Deserialize)]
 enum ChatResponse {
     AuthenticationResult {
         result: bool,
+        error: Option<ChatAuthenticationError>,
     },
     Message {
         user_name: String,
@@ -110,7 +116,16 @@ impl ChatServer {
             if !Self::verify_name(&name) {
                 info!("User {user_id} could not authenticate with name '{name}', disconnecting.");
 
-                return Some(vec![ChatServerResponseCommand::DisconnectUser(user_id)]);
+                return Some(vec![
+                    Self::make_response_to_user(
+                        &user_id,
+                        &ChatResponse::AuthenticationResult {
+                            result: false,
+                            error: Some(ChatAuthenticationError::WrongNameOrPassword),
+                        },
+                    ),
+                    ChatServerResponseCommand::DisconnectUser(user_id),
+                ]);
             }
 
             user.authenticated = true;
@@ -121,7 +136,10 @@ impl ChatServer {
             return Some(vec![
                 Self::make_response_to_user(
                     &user_id,
-                    &ChatResponse::AuthenticationResult { result: true },
+                    &ChatResponse::AuthenticationResult {
+                        result: true,
+                        error: None,
+                    },
                 ),
                 Self::make_response_to_all(&ChatResponse::Connection {
                     user_name: name.clone(),
