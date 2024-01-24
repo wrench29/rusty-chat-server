@@ -5,24 +5,28 @@ use tokio::{
     net::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener, TcpStream,
-    },
-    signal,
-    sync::Mutex,
-    task::yield_now,
+    }, signal, sync::Mutex, task::yield_now
 };
 use uuid::Uuid;
 
-use crate::server::{ChatServer, ChatServerResponseCommand};
+use crate::{
+    server::{ChatServer, ChatServerResponseCommand},
+    server_database::ServerDatabase,
+};
 
-pub struct ChatTcpServer {
+pub struct ChatTcpServer<T: ServerDatabase> {
     address: String,
     listener: Arc<TcpListener>,
     connections: Arc<Mutex<HashMap<String, OwnedWriteHalf>>>,
-    chat_server: Arc<Mutex<ChatServer>>,
+    chat_server: Arc<Mutex<ChatServer<T>>>,
 }
 
-impl ChatTcpServer {
-    pub async fn create_async(host: &str, port: u16) -> Result<Self, ()> {
+impl<T: ServerDatabase + Send + 'static> ChatTcpServer<T> {
+    pub async fn create_async(
+        host: &str,
+        port: u16,
+        chat_server: ChatServer<T>,
+    ) -> Result<Self, ()> {
         let address = format!("{host}:{port}");
 
         let address_ref = &address;
@@ -34,7 +38,7 @@ impl ChatTcpServer {
             address,
             listener: Arc::new(listener),
             connections: Arc::new(Mutex::new(HashMap::new())),
-            chat_server: Arc::new(Mutex::new(ChatServer::new())),
+            chat_server: Arc::new(Mutex::new(chat_server)),
         })
     }
 
@@ -62,10 +66,10 @@ impl ChatTcpServer {
     }
 }
 
-async fn tcp_listener_loop(
+async fn tcp_listener_loop<T: ServerDatabase + Send + 'static>(
     listener: Arc<TcpListener>,
     connections: Arc<Mutex<HashMap<String, OwnedWriteHalf>>>,
-    chat_server: Arc<Mutex<ChatServer>>,
+    chat_server: Arc<Mutex<ChatServer<T>>>,
 ) {
     loop {
         match listener.accept().await {
@@ -135,8 +139,14 @@ async fn process_command(
 
     for connection_id in final_users_list {
         let connections = connections.lock().await;
-        let connection = connections.get(&connection_id).unwrap();
+        let connection = if let Some(connection) = connections.get(&connection_id) {
+            connection
+        } else {
+            continue;
+        };
+
         info!("Sending to {connection_id}...");
+
         {
             let write_result = write_message(connection, &message_bytes).await;
             if write_result.is_err() {
@@ -149,10 +159,10 @@ async fn process_command(
     }
 }
 
-async fn handle_incoming_tcp_stream(
+async fn handle_incoming_tcp_stream<T: ServerDatabase>(
     stream: TcpStream,
     connections: Arc<Mutex<HashMap<String, OwnedWriteHalf>>>,
-    chat_server: Arc<Mutex<ChatServer>>,
+    chat_server: Arc<Mutex<ChatServer<T>>>,
 ) {
     let connection_id = Uuid::new_v4().to_string();
 

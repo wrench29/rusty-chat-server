@@ -3,12 +3,17 @@ use std::{io::Write, time::SystemTime};
 use env_logger::fmt::Color;
 use log::{error, warn, LevelFilter};
 
+use server::ChatServer;
+use server_database::ServerSQLiteDatabase;
 use tcp_server::ChatTcpServer;
 use time::{format_description::parse, OffsetDateTime};
+use user_service::UserService;
 
 mod config;
-mod tcp_server;
 mod server;
+mod server_database;
+mod tcp_server;
+mod user_service;
 
 fn get_ip_port_from_config() -> (String, u16) {
     let config_obj = config::read_config();
@@ -66,9 +71,12 @@ async fn main() -> Result<(), ()> {
         })
         .init();
 
-    let (host, port) = get_ip_port_from_config();
+    let sqlite_database = ServerSQLiteDatabase::default();
+    let user_service = UserService::new(sqlite_database);
+    let chat_server = ChatServer::new(user_service);
 
-    let tcp_chat_server = ChatTcpServer::create_async(&host, port).await?;
+    let (host, port) = get_ip_port_from_config();
+    let tcp_chat_server = ChatTcpServer::create_async(&host, port, chat_server).await?;
 
     tcp_chat_server.run().await;
 

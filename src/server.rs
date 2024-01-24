@@ -4,6 +4,11 @@ use log::info;
 use serde::{Deserialize, Serialize};
 use serde_json::from_str;
 
+use crate::{
+    server_database::{ServerDatabase, UserCredentialsRaw},
+    user_service::{AuthenticationError, RegistrationError, UserService},
+};
+
 pub enum ChatServerResponseCommand {
     SendToAll(Vec<u8>),
     SendToAllExcept(String, Vec<u8>),
@@ -13,20 +18,26 @@ pub enum ChatServerResponseCommand {
 
 #[derive(Serialize, Deserialize)]
 enum ChatRequest {
-    Authentication { name: String },
-    Message { message: String },
-}
-
-#[derive(Serialize, Deserialize)]
-pub enum ChatAuthenticationError {
-    WrongNameOrPassword,
+    Authentication {
+        user_credentials_raw: UserCredentialsRaw,
+    },
+    Registration {
+        user_credentials_raw: UserCredentialsRaw,
+    },
+    Message {
+        message: String,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
 enum ChatResponse {
     AuthenticationResult {
         result: bool,
-        error: Option<ChatAuthenticationError>,
+        error: Option<AuthenticationError>,
+    },
+    RegistrationResult {
+        result: bool,
+        error: Option<RegistrationError>,
     },
     Message {
         user_name: String,
@@ -38,29 +49,27 @@ enum ChatResponse {
     },
 }
 
-struct UserCredentials {
-    name: String,
-}
-
 struct UserData {
     authenticated: bool,
-    credentials: Option<UserCredentials>,
+    name: Option<String>,
 }
 
 struct ChatState {
     users: HashMap<String, UserData>,
 }
 
-pub struct ChatServer {
+pub struct ChatServer<T: ServerDatabase> {
     state: ChatState,
+    user_service: UserService<T>,
 }
 
-impl ChatServer {
-    pub fn new() -> Self {
+impl<T: ServerDatabase> ChatServer<T> {
+    pub fn new(user_service: UserService<T>) -> Self {
         Self {
             state: ChatState {
                 users: HashMap::new(),
             },
+            user_service,
         }
     }
     pub fn on_user_connect(&mut self, user_id: String) {
@@ -69,7 +78,7 @@ impl ChatServer {
             user_id,
             UserData {
                 authenticated: false,
-                credentials: None,
+                name: None,
             },
         );
     }
@@ -77,7 +86,7 @@ impl ChatServer {
         let user = self.state.users.get_mut(&user_id)?;
 
         if user.authenticated {
-            let user_name = user.credentials.as_ref().unwrap().name.to_string();
+            let user_name = user.name.as_ref().unwrap();
 
             info!("User {user_id} with name {user_name} has disconnected.");
 
@@ -97,67 +106,137 @@ impl ChatServer {
         message: &[u8],
     ) -> Option<Vec<ChatServerResponseCommand>> {
         let request = Self::message_to_request(message)?;
-        let user = self.state.users.get_mut(&user_id)?;
+        let is_authenticated = self.state.users.get(&user_id)?.authenticated;
 
-        if user.authenticated {
-            if let ChatRequest::Message { message } = request {
-                let user_name = &user.credentials.as_ref().unwrap().name;
+        if is_authenticated {
+            self.process_request_authenticated(&user_id, request)
+        } else {
+            self.process_request_unauthenticated(&user_id, request)
+        }
+    }
 
-                info!("User {user_id} with name {user_name} has sent message '{message}'.",);
+    fn process_request_authenticated(
+        &mut self,
+        user_id: &str,
+        request: ChatRequest,
+    ) -> Option<Vec<ChatServerResponseCommand>> {
+        if let ChatRequest::Message { message } = request {
+            let user_name = self.state.users.get(user_id)?.name.as_ref()?;
 
-                let response = ChatResponse::Message {
-                    user_name: user_name.to_string(),
-                    message,
-                };
+            info!("User {user_id} with name {user_name} has sent message '{message}'.",);
 
-                return Some(vec![Self::make_response_to_all(&response)]);
-            }
-        } else if let ChatRequest::Authentication { name } = request {
-            if !Self::verify_name(&name) {
-                info!("User {user_id} could not authenticate with name '{name}', disconnecting.");
-
-                return Some(vec![
-                    Self::make_response_to_user(
-                        &user_id,
-                        &ChatResponse::AuthenticationResult {
-                            result: false,
-                            error: Some(ChatAuthenticationError::WrongNameOrPassword),
-                        },
-                    ),
-                    ChatServerResponseCommand::DisconnectUser(user_id),
-                ]);
-            }
-
-            user.authenticated = true;
-            user.credentials = Some(UserCredentials { name: name.clone() });
-
-            info!("User {user_id} has authenticated with name '{name}'.");
+            let response = ChatResponse::Message {
+                user_name: user_name.to_string(),
+                message,
+            };
 
             return Some(vec![
-                Self::make_response_to_user(
-                    &user_id,
-                    &ChatResponse::AuthenticationResult {
+                self.make_response_to_all_authenticated(user_id, &response)
+            ]);
+        }
+        None
+    }
+    fn process_request_unauthenticated(
+        &mut self,
+        user_id: &str,
+        request: ChatRequest,
+    ) -> Option<Vec<ChatServerResponseCommand>> {
+        match request {
+            ChatRequest::Authentication {
+                user_credentials_raw,
+            } => self.authenticate(user_id, &user_credentials_raw),
+            ChatRequest::Registration {
+                user_credentials_raw,
+            } => self.register(user_id, &user_credentials_raw),
+            ChatRequest::Message { message: _ } => None,
+        }
+    }
+
+    fn register(
+        &mut self,
+        user_id: &str,
+        user_credentials_raw: &UserCredentialsRaw,
+    ) -> Option<Vec<ChatServerResponseCommand>> {
+        match self.user_service.add_user(user_credentials_raw) {
+            Ok(_) => {
+                info!(
+                    "User {user_id} has registered with name '{}'.",
+                    user_credentials_raw.name
+                );
+
+                Some(vec![Self::make_response_to_user(
+                    user_id,
+                    &ChatResponse::RegistrationResult {
                         result: true,
                         error: None,
                     },
-                ),
-                Self::make_response_to_all(&ChatResponse::Connection {
-                    user_name: name.clone(),
-                    is_connected: true,
-                }),
-            ]);
-        }
+                )])
+            }
+            Err(e) => {
+                info!(
+                    "User {user_id} could not register with name '{}', disconnecting.",
+                    user_credentials_raw.name
+                );
 
-        None
+                Some(vec![Self::make_response_to_user(
+                    user_id,
+                    &ChatResponse::RegistrationResult {
+                        result: false,
+                        error: Some(e),
+                    },
+                )])
+            }
+        }
     }
 
-    fn verify_name(name: &str) -> bool {
-        // let regex_str = r"^(?=.{8,20}$)(?![_.])(?!.*[_.]{2})[a-zA-Z0-9._]+(?<![_.])$";
-        // let regex = Regex::new(regex_str).unwrap();
+    fn authenticate(
+        &mut self,
+        user_id: &str,
+        user_credentials_raw: &UserCredentialsRaw,
+    ) -> Option<Vec<ChatServerResponseCommand>> {
+        match self.user_service.authenticate_user(user_credentials_raw) {
+            Ok(_) => {
+                let user_data = self.state.users.get_mut(user_id)?;
+                user_data.authenticated = true;
+                user_data.name = Some(user_credentials_raw.name.clone());
 
-        // regex.is_match(name.as_bytes())
+                info!(
+                    "User {user_id} has authenticated with name '{}'.",
+                    user_credentials_raw.name
+                );
 
-        name.len() > 8 && name.len() < 20
+                Some(vec![
+                    Self::make_response_to_user(
+                        user_id,
+                        &ChatResponse::AuthenticationResult {
+                            result: true,
+                            error: None,
+                        },
+                    ),
+                    self.make_response_to_all_authenticated(
+                        user_id,
+                        &ChatResponse::Connection {
+                            user_name: user_credentials_raw.name.clone(),
+                            is_connected: true,
+                        },
+                    ),
+                ])
+            }
+            Err(e) => {
+                info!(
+                    "User {user_id} could not authenticate with name '{}'.",
+                    user_credentials_raw.name
+                );
+
+                Some(vec![Self::make_response_to_user(
+                    user_id,
+                    &ChatResponse::AuthenticationResult {
+                        result: false,
+                        error: Some(e),
+                    },
+                )])
+            }
+        }
     }
 
     fn message_to_request(message: &[u8]) -> Option<ChatRequest> {
@@ -180,5 +259,26 @@ impl ChatServer {
     fn make_response_to_all(response: &ChatResponse) -> ChatServerResponseCommand {
         let message = serde_json::to_string(response).unwrap();
         ChatServerResponseCommand::SendToAll(message.into_bytes())
+    }
+
+    fn make_response_to_all_authenticated(
+        &self,
+        sender_user_id: &str,
+        response: &ChatResponse,
+    ) -> ChatServerResponseCommand {
+        let users = {
+            let mut authenticated_users = Vec::<String>::new();
+            for (user_id, user_data) in &self.state.users {
+                if user_id == sender_user_id {
+                    continue;
+                }
+                if user_data.authenticated {
+                    authenticated_users.push(user_id.to_string());
+                }
+            }
+            authenticated_users
+        };
+        let message = serde_json::to_string(response).unwrap();
+        ChatServerResponseCommand::SendToSome(users, message.into_bytes())
     }
 }
