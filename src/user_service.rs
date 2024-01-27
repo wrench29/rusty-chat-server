@@ -166,9 +166,6 @@ impl<T: ServerDatabase> UserService<T> {
     }
 
     fn verify_name(name: &str) -> Result<(), UserNameError> {
-        // Q: UUUHH WHY NOT USE REGULAR EXPRESSION HUH???!?!?!
-        // A: iДi нахуй
-
         if name.len() < 7 || name.len() > 32 {
             return Err(UserNameError::IncorrectLength(7, 32));
         }

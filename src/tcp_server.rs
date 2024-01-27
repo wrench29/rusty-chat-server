@@ -5,7 +5,10 @@ use tokio::{
     net::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener, TcpStream,
-    }, signal, sync::Mutex, task::yield_now
+    },
+    signal, spawn,
+    sync::Mutex,
+    task::yield_now,
 };
 use uuid::Uuid;
 
@@ -17,7 +20,7 @@ use crate::{
 pub struct ChatTcpServer<T: ServerDatabase> {
     address: String,
     listener: Arc<TcpListener>,
-    connections: Arc<Mutex<HashMap<String, OwnedWriteHalf>>>,
+    connections: Arc<Mutex<HashMap<String, Arc<OwnedWriteHalf>>>>,
     chat_server: Arc<Mutex<ChatServer<T>>>,
 }
 
@@ -68,7 +71,7 @@ impl<T: ServerDatabase + Send + 'static> ChatTcpServer<T> {
 
 async fn tcp_listener_loop<T: ServerDatabase + Send + 'static>(
     listener: Arc<TcpListener>,
-    connections: Arc<Mutex<HashMap<String, OwnedWriteHalf>>>,
+    connections: Arc<Mutex<HashMap<String, Arc<OwnedWriteHalf>>>>,
     chat_server: Arc<Mutex<ChatServer<T>>>,
 ) {
     loop {
@@ -88,7 +91,7 @@ async fn tcp_listener_loop<T: ServerDatabase + Send + 'static>(
 }
 
 async fn process_command(
-    connections: Arc<Mutex<HashMap<String, OwnedWriteHalf>>>,
+    connections: Arc<Mutex<HashMap<String, Arc<OwnedWriteHalf>>>>,
     command: ChatServerResponseCommand,
 ) {
     let message_to_send: Option<Vec<u8>>;
@@ -137,31 +140,42 @@ async fn process_command(
 
     let message_bytes = message_to_send.unwrap();
 
-    for connection_id in final_users_list {
+    let mut join_handles = Vec::new();
+
+    for connection_id in &final_users_list {
         let connections = connections.lock().await;
-        let connection = if let Some(connection) = connections.get(&connection_id) {
-            connection
+        let connection = if let Some(connection) = connections.get(connection_id) {
+            connection.clone()
         } else {
             continue;
         };
 
         info!("Sending to {connection_id}...");
+        join_handles.push(spawn(write_message(connection, message_bytes.clone())));
+    }
 
-        {
-            let write_result = write_message(connection, &message_bytes).await;
-            if write_result.is_err() {
-                let e = write_result.err().unwrap();
-                error!("Could not send message to connection {connection_id} ({e}).");
-                break;
-            }
+    let mut i = 0;
+    for handle in join_handles {
+        let write_result = if let Ok(result) = handle.await {
+            result
+        } else {
+            i += 1;
+            continue;
+        };
+        let connection_id = &final_users_list[i];
+        if let Err(e) = write_result {
+            error!("Could not send message to connection {connection_id} ({e}).");
+        } else {
+            info!("Sent successfully to {connection_id}.");
         }
-        info!("Sent successfully to {connection_id}.");
+
+        i += 1;
     }
 }
 
 async fn handle_incoming_tcp_stream<T: ServerDatabase>(
     stream: TcpStream,
-    connections: Arc<Mutex<HashMap<String, OwnedWriteHalf>>>,
+    connections: Arc<Mutex<HashMap<String, Arc<OwnedWriteHalf>>>>,
     chat_server: Arc<Mutex<ChatServer<T>>>,
 ) {
     let connection_id = Uuid::new_v4().to_string();
@@ -171,7 +185,7 @@ async fn handle_incoming_tcp_stream<T: ServerDatabase>(
     connections
         .lock()
         .await
-        .insert(connection_id.clone(), write_stream);
+        .insert(connection_id.clone(), Arc::new(write_stream));
 
     chat_server
         .lock()
@@ -235,16 +249,16 @@ async fn read_message(connection_id: String, stream: &OwnedReadHalf) -> io::Resu
     Ok(buffer)
 }
 
-async fn write_message(stream: &OwnedWriteHalf, buf: &[u8]) -> io::Result<()> {
+async fn write_message(stream: Arc<OwnedWriteHalf>, buf: Vec<u8>) -> io::Result<()> {
     let header = (buf.len() as u32).to_le_bytes();
 
-    let write_result = write_to_stream(stream, &header).await;
+    let write_result = write_to_stream(&stream, &header).await;
     if write_result.is_err() {
         let e = write_result.err().unwrap();
         return Err(e);
     }
 
-    let write_result = write_to_stream(stream, buf).await;
+    let write_result = write_to_stream(&stream, &buf).await;
     if write_result.is_err() {
         let e = write_result.err().unwrap();
         return Err(e);

@@ -130,9 +130,11 @@ impl<T: ServerDatabase> ChatServer<T> {
                 message,
             };
 
-            return Some(vec![
-                self.make_response_to_all_authenticated(user_id, &response)
-            ]);
+            return Some(vec![self.make_response_to_all_authenticated(
+                user_id,
+                Some(user_id),
+                &response,
+            )]);
         }
         None
     }
@@ -215,6 +217,7 @@ impl<T: ServerDatabase> ChatServer<T> {
                     ),
                     self.make_response_to_all_authenticated(
                         user_id,
+                        None,
                         &ChatResponse::Connection {
                             user_name: user_credentials_raw.name.clone(),
                             is_connected: true,
@@ -264,6 +267,7 @@ impl<T: ServerDatabase> ChatServer<T> {
     fn make_response_to_all_authenticated(
         &self,
         sender_user_id: &str,
+        sender: Option<&str>,
         response: &ChatResponse,
     ) -> ChatServerResponseCommand {
         let users = {
@@ -275,6 +279,9 @@ impl<T: ServerDatabase> ChatServer<T> {
                 if user_data.authenticated {
                     authenticated_users.push(user_id.to_string());
                 }
+            }
+            if let Some(sender) = sender {
+                authenticated_users.push(sender.to_string());
             }
             authenticated_users
         };
